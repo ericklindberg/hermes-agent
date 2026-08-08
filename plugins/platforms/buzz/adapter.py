@@ -344,6 +344,15 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _parse_message_page(stdout: str) -> List[dict]:
+    """Strictly parse one successful messages page; malformed output is fatal."""
+    data = json.loads(stdout)
+    if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+        raise ValueError("Buzz messages page is not an array of objects")
+    return data
+
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -436,6 +445,9 @@ class BuzzAdapter(BasePlatformAdapter):
         self._channel_meta: Dict[str, dict] = {}
         self._user_names: Dict[str, str] = {}
         self._poll_count = 0
+        # event_id -> {"lock": asyncio.Lock, "users": waiter/holder count}
+        self._inbound_locks: Dict[str, dict] = {}
+        self._inbound_ledger = None
 
     @property
     def name(self) -> str:
@@ -919,31 +931,57 @@ class BuzzAdapter(BasePlatformAdapter):
             raise
 
     async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
-        """Initialize a channel's high-water mark from its newest events."""
         state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
-        self._channel_state[channel_id] = state
-        code, out, err = await self._run_cli(
-            ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        )
-        if code != 0:
-            logger.warning(
-                "Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code)
-            )
-            # Fall back to "now" so a transiently unreadable channel does not
-            # replay its whole history once it becomes readable.
-            state["last_ts"] = int(time.time())
-            return
-        for event in _parse_json_list(out):
-            event_id = event.get("id")
-            created_at = int(event.get("created_at") or 0)
-            if event_id:
-                state["seen"][str(event_id)] = None
-            state["last_ts"] = max(state["last_ts"], created_at)
-            # History is never dispatched, but it still classifies: a DM that
-            # leaked in via ``channels list`` latches to chat_type="dm" here,
-            # so it bypasses the mention gate from the very first poll.
-            self._maybe_latch_dm(channel_id, state, event)
-        self._trim_seen(state)
+        if await self._drain_channel(channel_id, state, seed=True):
+            self._channel_state[channel_id] = state
+
+    async def _drain_channel(self, channel_id: str, state: dict, *, seed: bool = False) -> bool:
+        base = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+        floor = int(state.get("last_ts") or 0) if not seed else 0
+        cursor = None
+        high_water = floor
+        try:
+            while True:
+                args = list(base)
+                if floor:
+                    args += ["--since", str(floor)]
+                if cursor:
+                    args += ["--before", str(cursor[0]), "--before-id", cursor[1]]
+                code, out, err = await self._run_cli(args)
+                if code != 0:
+                    logger.debug("Buzz: message drain of %s failed — %s", channel_id, _cli_error_message(err, code))
+                    return False
+                page = _parse_message_page(out)
+                if not page:
+                    state["last_ts"] = high_water
+                    self._trim_seen(state)
+                    return True
+                records = [(str(e.get("id") or ""), int(e.get("created_at") or 0)) for e in page]
+                if any(not i for i, _ in records):
+                    raise ValueError("message without id")
+                oldest = min(t for _, t in records)
+                next_cursor = (oldest, max(i for i, t in records if t == oldest))
+                if cursor and not (next_cursor[0] < cursor[0] or (next_cursor[0] == cursor[0] and next_cursor[1] > cursor[1])):
+                    raise ValueError("message cursor did not advance")
+                for event in page:
+                    ts = int(event.get("created_at") or 0)
+                    if not seed and ts < floor:
+                        continue
+                    if seed:
+                        state["seen"][str(event["id"])] = None
+                        self._maybe_latch_dm(channel_id, state, event)
+                    else:
+                        await self._handle_event(channel_id, state, event, advance_last_ts=False)
+                    high_water = max(high_water, ts)
+                self._trim_seen(state)
+                if len(page) < _FETCH_LIMIT:
+                    state["last_ts"] = high_water
+                    self._trim_seen(state)
+                    return True
+                cursor = next_cursor
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Buzz: invalid message page for %s: %s", channel_id, exc)
+            return False
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
@@ -990,72 +1028,89 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._channel_state.get(channel_id)
         if state is None:
             return
-        args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        if state["last_ts"]:
-            # Nostr `since` is inclusive: same-second events are re-fetched
-            # and de-duped by id below.
-            args += ["--since", str(state["last_ts"])]
-        code, out, err = await self._run_cli(args)
-        if code != 0:
-            logger.debug(
-                "Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code)
-            )
-            return
-        for event in _parse_json_list(out):
-            await self._handle_event(channel_id, state, event)
-        self._trim_seen(state)
+        await self._drain_channel(channel_id, state)
 
-    async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
+    async def _handle_event(self, channel_id: str, state: dict, event: dict, *, advance_last_ts: bool = True) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
-        if not event_id or event_id in state["seen"]:
-            return
-        state["seen"][event_id] = None
-        state["last_ts"] = max(state["last_ts"], created_at)
-
-        if int(event.get("kind") or 0) != _CHAT_KIND:
-            return
-        pubkey = str(event.get("pubkey") or "").lower()
-        content = event.get("content")
-        if not pubkey or not isinstance(content, str) or not content.strip():
+        if not event_id:
             return
 
-        # Suppress self-echo: never dispatch our own messages back to the agent.
-        if pubkey == self._self_pubkey:
-            return
+        lock_state = self._inbound_locks.get(event_id)
+        if lock_state is None:
+            lock_state = {"lock": asyncio.Lock(), "users": 0}
+            self._inbound_locks[event_id] = lock_state
+        lock_state["users"] += 1
+        try:
+            async with lock_state["lock"]:
+                if event_id in state["seen"]:
+                    return
+                received = time.monotonic()
+                self._emit_inbound_ledger(event_id, "receipt", received, "received")
+                if int(event.get("kind") or 0) != _CHAT_KIND:
+                    state["seen"][event_id] = None
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
+                    return
+                pubkey = str(event.get("pubkey") or "").lower()
+                content = event.get("content")
+                if not pubkey or not isinstance(content, str) or not content.strip() or pubkey == self._self_pubkey:
+                    state["seen"][event_id] = None
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
+                    return
+                self._maybe_latch_dm(channel_id, state, event)
+                is_dm = state["chat_type"] == "dm"
+                if not is_dm and self.require_mention and not self._is_mentioned(content):
+                    state["seen"][event_id] = None
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
+                    return
+                if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+                    state["seen"][event_id] = None
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
+                    return
+                self._emit_inbound_ledger(event_id, "admission", received, "admitting")
+                dispatch_text = self._strip_mention(content)
+                try:
+                    await self._dispatch_message(
+                        text=dispatch_text, chat_id=channel_id,
+                        chat_type="dm" if is_dm else "group", user_id=pubkey,
+                        user_name=await self._resolve_user_name(pubkey),
+                        message_id=event_id, created_at=created_at,
+                    )
+                except Exception:
+                    self._emit_inbound_ledger(event_id, "dispatch", received, "failed")
+                    raise
+                state["seen"][event_id] = None
+                if advance_last_ts:
+                    state["last_ts"] = max(state["last_ts"], created_at)
+                self._emit_inbound_ledger(event_id, "dispatch", received, "success")
+        finally:
+            lock_state["users"] -= 1
+            if lock_state["users"] == 0 and self._inbound_locks.get(event_id) is lock_state:
+                self._inbound_locks.pop(event_id, None)
 
-        # Reclassify a leaked DM before gating so its first un-mentioned
-        # message both latches the conversation and dispatches.
-        self._maybe_latch_dm(channel_id, state, event)
-
-        is_dm = state["chat_type"] == "dm"
-        # In shared channels, respond only when addressed — unless
-        # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
-            return
-
-        # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
-        # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
-        if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
-            logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
-            return
-
-        # Strip a leading @mention so slash commands (@Chip /whoami ->
-        # /whoami) and clean prompts are recognized. DM messages often still
-        # open with "@Chip" even though no mention is required there, so the
-        # strip applies to both chat types.
-        dispatch_text = self._strip_mention(content)
-
-        await self._dispatch_message(
-            text=dispatch_text,
-            chat_id=channel_id,
-            chat_type="dm" if is_dm else "group",
-            user_id=pubkey,
-            user_name=await self._resolve_user_name(pubkey),
-            message_id=event_id,
-            created_at=created_at,
+    def _emit_inbound_ledger(self, event_id: str, stage: str, started: float, status: str) -> None:
+        entry = {
+            "event_id": event_id,
+            "stage": stage,
+            "duration_ms": max(0, int((time.monotonic() - started) * 1000)),
+            "queue_depth": min(len(self._inbound_locks), _SEEN_CAP),
+            "status": status,
+        }
+        hook = self._inbound_ledger
+        if callable(hook):
+            try:
+                hook(entry)
+            except Exception:
+                logger.warning("Buzz inbound ledger hook failed", exc_info=True)
+        logger.info(
+            "Buzz inbound ledger event_id=%s stage=%s duration_ms=%d queue_depth=%d status=%s",
+            entry["event_id"], entry["stage"], entry["duration_ms"],
+            entry["queue_depth"], entry["status"],
         )
 
     # ── DM classification (issue #68871) ──────────────────────────────────

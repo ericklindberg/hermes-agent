@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import OrderedDict
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -186,6 +187,97 @@ class TestPollingDedupe:
         # Seeding must never replay history into the agent
         assert adapter._dispatched == []
 
+    @staticmethod
+    def _full_page(prefix="page", *, oldest_ts=100, newest_ts=200):
+        events = [
+            _event("a", content="@Chip history", created_at=oldest_ts),
+            _event("c", content="@Chip history", created_at=oldest_ts),
+            _event("b", content="@Chip history", created_at=oldest_ts),
+        ]
+        events.extend(
+            _event(f"{prefix}-{index:02d}", content="@Chip history", created_at=newest_ts)
+            for index in range(_buzz_mod._FETCH_LIMIT - len(events))
+        )
+        return events
+
+    @staticmethod
+    def _message_calls(cli):
+        return [args for args, _ in cli.calls if args[:2] == ["messages", "get"]]
+
+    @pytest.mark.asyncio
+    async def test_seed_drains_full_page_with_composite_cursor(self, adapter):
+        cli = _ScriptedCli()
+        first = self._full_page()
+        cli.script("messages", "get", first)
+        cli.script("messages", "get", [_event("older", created_at=90)])
+        adapter._run_cli = cli
+
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        state = adapter._channel_state[CHANNEL]
+        assert state["last_ts"] == 200
+        assert len(state["seen"]) == len(first) + 1
+        continuation = self._message_calls(cli)[1]
+        assert continuation[continuation.index("--before") + 1] == "100"
+        assert continuation[continuation.index("--before-id") + 1] == "c"
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_poll_keeps_fixed_floor_and_high_water_on_later_page_failure(self, adapter):
+        state = {"chat_type": "group", "last_ts": 100, "seen": OrderedDict()}
+        adapter._channel_state[CHANNEL] = state
+        cli = _ScriptedCli()
+        first = self._full_page(prefix="poll", oldest_ts=101, newest_ts=102)
+        cli.script("messages", "get", first)
+        cli.script("messages", "get", "not-json")
+        adapter._run_cli = cli
+
+        assert await adapter._drain_channel(CHANNEL, state) is False
+        assert state["last_ts"] == 100
+        assert len(adapter._dispatched) == len(first)
+        message_calls = self._message_calls(cli)
+        assert all("--since" in call for call in message_calls)
+        assert all(call[call.index("--since") + 1] == "100" for call in message_calls)
+        assert "--before-id" in message_calls[1]
+
+    @pytest.mark.asyncio
+    async def test_nonadvancing_full_page_fails_without_committing_high_water(self, adapter):
+        state = {"chat_type": "group", "last_ts": 100, "seen": OrderedDict()}
+        adapter._channel_state[CHANNEL] = state
+        cli = _ScriptedCli()
+        page = self._full_page(prefix="repeat", oldest_ts=101, newest_ts=102)
+        cli.script("messages", "get", page)
+        cli.script("messages", "get", page)
+        adapter._run_cli = cli
+
+        assert await adapter._drain_channel(CHANNEL, state) is False
+        assert state["last_ts"] == 100
+        assert len(self._message_calls(cli)) == 2
+
+    @pytest.mark.asyncio
+    async def test_exact_full_terminal_page_gets_empty_probe(self, adapter):
+        state = {"chat_type": "group", "last_ts": 100, "seen": OrderedDict()}
+        adapter._channel_state[CHANNEL] = state
+        cli = _ScriptedCli()
+        page = self._full_page(prefix="terminal", oldest_ts=101, newest_ts=102)
+        cli.script("messages", "get", page)
+        cli.script("messages", "get", [])
+        adapter._run_cli = cli
+
+        assert await adapter._drain_channel(CHANNEL, state) is True
+        assert state["last_ts"] == 102
+        assert len(self._message_calls(cli)) == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_seed_is_retryable_and_not_installed(self, adapter):
+        cli = _ScriptedCli()
+        cli.script("messages", "get", "not-json")
+        adapter._run_cli = cli
+
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        assert CHANNEL not in adapter._channel_state
+
     @pytest.mark.asyncio
     async def test_new_event_dispatched_once(self, adapter):
         cli = _ScriptedCli()
@@ -207,6 +299,106 @@ class TestPollingDedupe:
         # Poll 2: identical response — the seen-id set must de-dupe
         await adapter._poll_channel(CHANNEL)
         assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_is_retryable(self, adapter):
+        attempts = 0
+
+        async def flaky(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("admission failed")
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = flaky
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        event = _event("retry", content="@Chip retry", created_at=10)
+        with pytest.raises(RuntimeError):
+            await adapter._handle_event(CHANNEL, state, event)
+        await adapter._handle_event(CHANNEL, state, event)
+        assert attempts == 2
+        assert [item["message_id"] for item in adapter._dispatched] == ["retry"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_duplicate_dispatches_once(self, adapter):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow(**kwargs):
+            started.set()
+            await release.wait()
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = slow
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        event = _event("concurrent", content="@Chip once", created_at=10)
+        first = asyncio.create_task(adapter._handle_event(CHANNEL, state, event))
+        await started.wait()
+        second = asyncio.create_task(adapter._handle_event(CHANNEL, state, event))
+        release.set()
+        await asyncio.gather(first, second)
+        assert [item["message_id"] for item in adapter._dispatched] == ["concurrent"]
+        assert adapter._inbound_locks == {}
+
+    @pytest.mark.asyncio
+    async def test_inbound_lock_is_released_after_failed_dispatch(self, adapter):
+        async def failing(**kwargs):
+            raise RuntimeError("admission failed")
+
+        adapter._dispatch_message = failing
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        with pytest.raises(RuntimeError):
+            await adapter._handle_event(
+                CHANNEL, state, _event("failed-lock", content="@Chip retry", created_at=10)
+            )
+        assert adapter._inbound_locks == {}
+
+    @pytest.mark.asyncio
+    async def test_inbound_ledger_contains_only_safe_timing_fields(self, adapter):
+        ledger = []
+        adapter._inbound_ledger = ledger.append
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        await adapter._handle_event(CHANNEL, state, _event("ledger", content="@Chip secret prompt", created_at=10))
+        assert {entry["stage"] for entry in ledger} >= {"receipt", "admission", "dispatch"}
+        for entry in ledger:
+            assert set(entry) <= {"event_id", "stage", "duration_ms", "queue_depth", "status"}
+            assert entry["event_id"] == "ledger"
+            assert isinstance(entry["duration_ms"], int)
+            assert "secret" not in repr(entry)
+
+    @pytest.mark.asyncio
+    async def test_inbound_ledger_logs_safe_fields_without_hook(self, adapter, caplog):
+        adapter._inbound_ledger = None
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        with caplog.at_level("INFO"):
+            await adapter._handle_event(
+                CHANNEL, state, _event("logged-ledger", content="@Chip private payload", created_at=10)
+            )
+        messages = [record.getMessage() for record in caplog.records if "Buzz inbound ledger" in record.getMessage()]
+        assert any("stage=receipt" in message for message in messages)
+        assert any("stage=dispatch" in message and "status=success" in message for message in messages)
+        assert all("private payload" not in message for message in messages)
+        assert all(OTHER_PUBKEY not in message for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_inbound_ledger_hook_failure_never_blocks_admission(self, adapter):
+        def broken_hook(_entry):
+            raise RuntimeError("metrics sink unavailable")
+
+        adapter._inbound_ledger = broken_hook
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        await adapter._handle_event(
+            CHANNEL, state, _event("ledger-hook-failure", content="@Chip continue", created_at=10)
+        )
+        assert [item["message_id"] for item in adapter._dispatched] == ["ledger-hook-failure"]
+        assert "ledger-hook-failure" in state["seen"]
 
 
 # ── Mention gating / DMs / authorization ──────────────────────────────────
