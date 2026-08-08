@@ -209,6 +209,106 @@ class TestPollingDedupe:
         await adapter._poll_channel(CHANNEL)
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_is_retryable(self, adapter):
+        attempts = 0
+
+        async def flaky(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("admission failed")
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = flaky
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        event = _event("retry", content="@Chip retry", created_at=10)
+        with pytest.raises(RuntimeError):
+            await adapter._handle_event(CHANNEL, state, event)
+        await adapter._handle_event(CHANNEL, state, event)
+        assert attempts == 2
+        assert [item["message_id"] for item in adapter._dispatched] == ["retry"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_duplicate_dispatches_once(self, adapter):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow(**kwargs):
+            started.set()
+            await release.wait()
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = slow
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        event = _event("concurrent", content="@Chip once", created_at=10)
+        first = asyncio.create_task(adapter._handle_event(CHANNEL, state, event))
+        await started.wait()
+        second = asyncio.create_task(adapter._handle_event(CHANNEL, state, event))
+        release.set()
+        await asyncio.gather(first, second)
+        assert [item["message_id"] for item in adapter._dispatched] == ["concurrent"]
+        assert adapter._inbound_locks == {}
+
+    @pytest.mark.asyncio
+    async def test_inbound_lock_is_released_after_failed_dispatch(self, adapter):
+        async def failing(**kwargs):
+            raise RuntimeError("admission failed")
+
+        adapter._dispatch_message = failing
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        with pytest.raises(RuntimeError):
+            await adapter._handle_event(
+                CHANNEL, state, _event("failed-lock", content="@Chip retry", created_at=10)
+            )
+        assert adapter._inbound_locks == {}
+
+    @pytest.mark.asyncio
+    async def test_inbound_ledger_contains_only_safe_timing_fields(self, adapter):
+        ledger = []
+        adapter._inbound_ledger = ledger.append
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        await adapter._handle_event(CHANNEL, state, _event("ledger", content="@Chip secret prompt", created_at=10))
+        assert {entry["stage"] for entry in ledger} >= {"receipt", "admission", "dispatch"}
+        for entry in ledger:
+            assert set(entry) <= {"event_id", "stage", "duration_ms", "queue_depth", "status"}
+            assert entry["event_id"] == "ledger"
+            assert isinstance(entry["duration_ms"], int)
+            assert "secret" not in repr(entry)
+
+    @pytest.mark.asyncio
+    async def test_inbound_ledger_logs_safe_fields_without_hook(self, adapter, caplog):
+        adapter._inbound_ledger = None
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        with caplog.at_level("INFO"):
+            await adapter._handle_event(
+                CHANNEL, state, _event("logged-ledger", content="@Chip private payload", created_at=10)
+            )
+        messages = [record.getMessage() for record in caplog.records if "Buzz inbound ledger" in record.getMessage()]
+        assert any("stage=receipt" in message for message in messages)
+        assert any("stage=dispatch" in message and "status=success" in message for message in messages)
+        assert all("private payload" not in message for message in messages)
+        assert all(OTHER_PUBKEY not in message for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_inbound_ledger_hook_failure_never_blocks_admission(self, adapter):
+        def broken_hook(_entry):
+            raise RuntimeError("metrics sink unavailable")
+
+        adapter._inbound_ledger = broken_hook
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        await adapter._handle_event(
+            CHANNEL, state, _event("ledger-hook-failure", content="@Chip continue", created_at=10)
+        )
+        assert [item["message_id"] for item in adapter._dispatched] == ["ledger-hook-failure"]
+        assert "ledger-hook-failure" in state["seen"]
+
 
 # ── Mention gating / DMs / authorization ──────────────────────────────────
 
