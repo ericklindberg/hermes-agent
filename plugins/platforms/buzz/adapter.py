@@ -349,6 +349,15 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _parse_message_page(stdout: str) -> List[dict]:
+    """Strictly parse one successful messages page; malformed output is fatal."""
+    data = json.loads(stdout)
+    if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+        raise ValueError("Buzz messages page is not an array of objects")
+    return data
+
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -1044,31 +1053,64 @@ class BuzzAdapter(BasePlatformAdapter):
             raise
 
     async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
-        """Initialize a channel's high-water mark from its newest events."""
+        """Drain history losslessly, then commit the observed high-water mark."""
         state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
         self._channel_state[channel_id] = state
-        code, out, err = await self._run_cli(
-            ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        )
-        if code != 0:
-            logger.warning(
-                "Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code)
-            )
-            # Fall back to "now" so a transiently unreadable channel does not
-            # replay its whole history once it becomes readable.
-            state["last_ts"] = int(time.time())
-            return
-        for event in _parse_json_list(out):
-            event_id = event.get("id")
-            created_at = int(event.get("created_at") or 0)
-            if event_id:
-                state["seen"][str(event_id)] = None
-            state["last_ts"] = max(state["last_ts"], created_at)
-            # History is never dispatched, but it still classifies: a DM that
-            # leaked in via ``channels list`` latches to chat_type="dm" here,
-            # so it bypasses the mention gate from the very first poll.
-            self._maybe_latch_dm(channel_id, state, event)
-        self._trim_seen(state)
+        await self._drain_channel(channel_id, state, seed=True)
+
+    async def _drain_channel(self, channel_id: str, state: dict, *, seed: bool = False) -> bool:
+        args_base = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+        cursor = None
+        staged = []
+        seen_pages = set()
+        floor_ts = int(state.get("last_ts") or 0) if not seed else 0
+        try:
+            while True:
+                args = list(args_base)
+                if cursor:
+                    args += ["--before", str(cursor[0]), "--before-id", cursor[1]]
+                elif state.get("last_ts"):
+                    args += ["--since", str(state["last_ts"])]
+                code, out, err = await self._run_cli(args)
+                if code != 0:
+                    logger.debug("Buzz: message drain of %s failed — %s", channel_id, _cli_error_message(err, code))
+                    return False
+                page = _parse_message_page(out)
+                if not page:
+                    break
+                page_key = tuple(str(event.get("id") or "") for event in page)
+                if page_key in seen_pages:
+                    logger.warning("Buzz: repeated message page for %s; stopping safely", channel_id)
+                    break
+                seen_pages.add(page_key)
+                staged.extend(page)
+                if len(page) < _FETCH_LIMIT:
+                    break
+                last = page[-1]
+                ts = int(last.get("created_at") or 0)
+                if not seed and ts < floor_ts:
+                    break
+                event_id = str(last.get("id") or "")
+                if not event_id:
+                    return False
+                cursor = (ts, event_id)
+            for event in staged:
+                if not seed and int(event.get("created_at") or 0) < floor_ts:
+                    continue
+                if seed:
+                    event_id = str(event.get("id") or "")
+                    if event_id:
+                        state["seen"][event_id] = None
+                    state["last_ts"] = max(state["last_ts"], int(event.get("created_at") or 0))
+                    self._maybe_latch_dm(channel_id, state, event)
+                else:
+                    await self._handle_event(channel_id, state, event)
+            self._trim_seen(state)
+            return True
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            logger.warning("Buzz: invalid message page for %s: %s", channel_id, exc)
+            return False
+
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
@@ -1115,20 +1157,7 @@ class BuzzAdapter(BasePlatformAdapter):
         state = self._channel_state.get(channel_id)
         if state is None:
             return
-        args = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        if state["last_ts"]:
-            # Nostr `since` is inclusive: same-second events are re-fetched
-            # and de-duped by id below.
-            args += ["--since", str(state["last_ts"])]
-        code, out, err = await self._run_cli(args)
-        if code != 0:
-            logger.debug(
-                "Buzz: poll of channel %s failed — %s", channel_id, _cli_error_message(err, code)
-            )
-            return
-        for event in _parse_json_list(out):
-            await self._handle_event(channel_id, state, event)
-        self._trim_seen(state)
+        await self._drain_channel(channel_id, state)
 
     async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
