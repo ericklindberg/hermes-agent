@@ -5,10 +5,11 @@ A plugin-based gateway adapter that connects to a Buzz community relay
 (Block's open-source human+agent collaboration platform, built on the
 Nostr protocol) and relays messages to/from the Hermes agent.
 
-The adapter does not speak Nostr itself — it shells out to the ``buzz``
-CLI binary ("JSON in, JSON out") via ``asyncio.create_subprocess_exec``.
-Inbound delivery uses a poll loop (the CLI is request/response); see the
-"Known limitations" note in the platform docs.
+Durable message and media operations shell out to the ``buzz`` CLI binary
+("JSON in, JSON out") via ``asyncio.create_subprocess_exec``.  Inbound
+delivery, presence heartbeats, typing indicators, and progressive message
+edits use one persistent NIP-42-authenticated Nostr WebSocket, with CLI polling
+as the inbound/presence fallback.
 
 Configuration in config.yaml::
 
@@ -106,6 +107,10 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+_PRESENCE_KIND = 20001
+_TYPING_KIND = 20002
+_MESSAGE_EDIT_KIND = 40003
+_PRESENCE_HEARTBEAT_SECONDS = 20.0
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -426,6 +431,9 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        self._ws_connection = None
+        self._ws_send_lock: Optional[asyncio.Lock] = None
+        self._presence_task: Optional[asyncio.Task] = None
         self._membership_since = 0
         self._lock_key: Optional[str] = None
         # channel_id -> {"chat_type", "last_ts", "seen": OrderedDict[event_id, None]}
@@ -557,6 +565,8 @@ class BuzzAdapter(BasePlatformAdapter):
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
+        await self._publish_presence("online")
+        self._presence_task = asyncio.create_task(self._presence_loop())
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
             self.relay_url,
@@ -570,6 +580,17 @@ class BuzzAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
         self._mark_disconnected()
+        if self._presence_task and not self._presence_task.done():
+            self._presence_task.cancel()
+            try:
+                await self._presence_task
+            except asyncio.CancelledError:
+                pass
+        self._presence_task = None
+        # Best-effort offline event while the authenticated socket is still
+        # available. Mobile treats presence as live-only telemetry.
+        if self._private_key:
+            await self._publish_presence("offline")
         lock_key = getattr(self, "_lock_key", None)
         if lock_key:
             try:
@@ -587,6 +608,8 @@ class BuzzAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._ws_task = None
+        self._ws_connection = None
+        self._ws_send_lock = None
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
             try:
@@ -635,8 +658,104 @@ class BuzzAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Buzz has no typing indicator API — no-op."""
-        pass
+        """Publish Buzz's ephemeral kind-20002 typing indicator."""
+        tags = [["h", str(chat_id)]]
+        thread_id = str((metadata or {}).get("thread_id") or "")
+        if re.fullmatch(r"[0-9a-fA-F]{64}", thread_id):
+            tags.append(["e", thread_id.lower(), "", "reply"])
+        await self._publish_realtime_event(_TYPING_KIND, "", tags)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Publish a kind-40003 Buzz edit for progressive response streaming."""
+        if not content:
+            return SendResult(success=False, message_id=message_id, error="Empty message")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", str(message_id)):
+            return SendResult(success=False, message_id=message_id, error="Invalid Buzz message id")
+        event = await self._publish_realtime_event(
+            _MESSAGE_EDIT_KIND,
+            content,
+            [["h", str(chat_id)], ["e", str(message_id).lower()]],
+        )
+        if event is None:
+            return SendResult(
+                success=False,
+                message_id=message_id,
+                error="Buzz WebSocket is not authenticated",
+                retryable=True,
+            )
+        return SendResult(
+            success=True,
+            message_id=message_id,
+            raw_response={"event_id": event["id"], "finalize": bool(finalize)},
+        )
+
+    async def _publish_realtime_event(
+        self,
+        kind: int,
+        content: str,
+        tags: List[List[str]],
+    ) -> Optional[dict]:
+        """Sign and publish one event on the persistent authenticated socket."""
+        websocket = self._ws_connection
+        if not self._ws_active or websocket is None or not self._private_key:
+            return None
+        try:
+            event = _load_nostr_auth().build_signed_event(
+                private_key=self._private_key,
+                kind=kind,
+                content=content,
+                tags=tags,
+            )
+            if self._ws_send_lock is None:
+                self._ws_send_lock = asyncio.Lock()
+            async with self._ws_send_lock:
+                await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+            return event
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "Buzz: real-time event kind %s could not be published",
+                kind,
+                exc_info=True,
+            )
+            return None
+
+    async def _publish_presence(self, status: str) -> bool:
+        """Publish presence, with the CLI's ephemeral path as poll fallback."""
+        if status not in ("online", "away", "offline"):
+            return False
+        if await self._publish_realtime_event(_PRESENCE_KIND, status, []):
+            return True
+        if not self.cli_path:
+            return False
+        code, _out, err = await self._run_cli(
+            ["users", "set-presence", "--status", status]
+        )
+        if code != 0:
+            logger.debug(
+                "Buzz: presence %s failed — %s",
+                status,
+                _cli_error_message(err, code),
+            )
+            return False
+        return True
+
+    async def _presence_loop(self) -> None:
+        """Refresh live-only mobile presence while the gateway is connected."""
+        try:
+            while True:
+                await asyncio.sleep(_PRESENCE_HEARTBEAT_SECONDS)
+                await self._publish_presence("online")
+        except asyncio.CancelledError:
+            raise
 
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Add a reaction to a message via buzz-cli.
@@ -857,6 +976,7 @@ class BuzzAdapter(BasePlatformAdapter):
                         max_size=_WS_MAX_MESSAGE_BYTES,
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
+                        self._ws_connection = websocket
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
                         if self._ws_ready is not None:
@@ -892,11 +1012,13 @@ class BuzzAdapter(BasePlatformAdapter):
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._ws_connection = None
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._ws_connection = None
 
     # ── Inbound polling ───────────────────────────────────────────────────
 

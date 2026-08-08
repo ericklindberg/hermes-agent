@@ -7,6 +7,7 @@ lifecycle as wired into BuzzAdapter.
 """
 
 import asyncio
+import hashlib
 import json
 import time
 
@@ -83,6 +84,53 @@ def test_build_auth_event_shape_and_owner_tag():
     assert ["auth", "b" * 64, "", "c" * 128] in event["tags"]
     assert len(bytes.fromhex(event["sig"])) == 64
     assert event["pubkey"] == nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+
+
+def test_build_signed_event_supports_buzz_realtime_kinds():
+    tags = [["h", CHANNEL], ["e", "a" * 64, "", "reply"]]
+    event = nostr_auth.build_signed_event(
+        private_key=TEST_PRIVATE_KEY,
+        kind=20002,
+        content="",
+        tags=tags,
+        created_at=1_700_000_001,
+        auxiliary_randomness=bytes(32),
+    )
+
+    serialized = json.dumps(
+        [0, event["pubkey"], 1_700_000_001, 20002, tags, ""],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    assert event["id"] == hashlib.sha256(serialized).hexdigest()
+    assert event["kind"] == 20002
+    assert event["tags"] == tags
+    assert len(bytes.fromhex(event["sig"])) == 64
+
+
+def test_build_auth_event_uses_generic_signed_event(monkeypatch):
+    captured = {}
+
+    def fake_build_signed_event(**kwargs):
+        captured.update(kwargs)
+        return {"id": "event"}
+
+    monkeypatch.setattr(nostr_auth, "build_signed_event", fake_build_signed_event)
+    event = nostr_auth.build_auth_event(
+        private_key=TEST_PRIVATE_KEY,
+        challenge="challenge-2",
+        relay_url="wss://relay.example",
+        created_at=1_700_000_002,
+        auxiliary_randomness=bytes(32),
+    )
+
+    assert event == {"id": "event"}
+    assert captured["kind"] == 22242
+    assert captured["content"] == ""
+    assert captured["tags"] == [
+        ["relay", "wss://relay.example"],
+        ["challenge", "challenge-2"],
+    ]
 
 
 # ── Adapter WS wiring ─────────────────────────────────────────────────────

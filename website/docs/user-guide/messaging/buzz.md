@@ -64,7 +64,8 @@ When wiring up Buzz, set these defaults in `config.yaml` to keep the channel cle
 display:
   platforms:
     buzz:
-      interim_assistant_messages: false   # suppress intermediate tool results, reasoning comments, and progress updates — only the final response reaches the channel
+      streaming: true                     # progressively edit one response while the model generates
+      interim_assistant_messages: false   # suppress tool results/reasoning; safe response text can still stream
       tool_progress: off                  # suppress tool progress bubbles (e.g., "Running terminal command...", "Reading file...")
 gateway:
   platforms:
@@ -86,6 +87,7 @@ gateway:
 **Why these defaults:**
 
 - `interim_assistant_messages: false` — prevents intermediate tool results, reasoning comments, and progress updates from being posted as separate messages to the channel. Only the final response goes to the channel.
+- `streaming: true` — progressively updates one Buzz message using signed kind-40003 edits; it does not expose tool output or hidden reasoning.
 - `tool_progress: off` — suppresses tool progress bubbles (e.g., "Running terminal command...", "Reading file..."). Keeps the channel focused on actual results, not process.
 - `poll_interval: 4` — balances inbound latency (up to 4s delay) against relay load. Lower values increase polling frequency; higher values reduce it.
 - `allowed_users: []` + `allow_all_users: false` — private mode by default. Only listed users can interact. Set `allow_all_users: true` for community mode where everyone can chat (admin tier still restricted to the owner).
@@ -117,7 +119,9 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 
 ## Notes and limitations
 
-- **Inbound is polled, not streamed.** The `buzz` CLI is request/response, so the adapter polls `buzz messages get` per watched channel every `poll_interval` seconds (default 4). Expect up to one interval of latency on inbound messages. A future optimization is a websocket transport (the Buzz repo ships `buzz-ws-client` for true streaming).
+- **WebSocket is preferred.** `transport: auto` uses a persistent NIP-42-authenticated subscription for near-instant inbound delivery and falls back to CLI polling when necessary. `transport: websocket` can require the real-time path.
+- **Presence and typing are live telemetry.** While the WebSocket is connected, Hermes publishes kind-20001 presence heartbeats and kind-20002 typing indicators. Mobile clients that open after an earlier ephemeral event may wait until the next heartbeat (normally no more than 20 seconds) before showing the agent online.
+- **Streaming uses edits, not internal progress.** With `display.platforms.buzz.streaming: true`, Hermes sends one visible response and updates it using kind-40003 edits. Tool progress and interim reasoning remain governed by their existing display settings and can stay disabled.
 - On (re)connect the adapter seeds its high-water mark from the newest events, so channel history is never replayed into the agent.
-- New DM conversations are discovered automatically (every few poll sweeps).
+- New DM conversations are discovered from live membership events, with periodic CLI discovery in poll fallback mode.
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.

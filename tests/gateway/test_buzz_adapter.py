@@ -30,6 +30,7 @@ SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
 SELF_NPUB = "npub1nl2u0wnd8mezfknc74q7pl9ec58h9nrrakce4tnk434qgaxl4psqe5twr6"
 OTHER_PUBKEY = "a" * 64
 CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
+TEST_PRIVATE_KEY = "00" * 31 + "03"
 # Real DM conversation as materialized by a hosted relay: `dms list` returns
 # [] for it (#68871) while `channels list` shows it as name "DM", empty
 # description, indistinguishable from a channel except via message p-tags.
@@ -386,6 +387,21 @@ class TestDmClassification:
 
 class TestBuzzAdapterSend:
 
+    class _CaptureWebSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, raw):
+            self.sent.append(json.loads(raw))
+
+    @staticmethod
+    def _activate_websocket(adapter):
+        websocket = TestBuzzAdapterSend._CaptureWebSocket()
+        adapter._private_key = TEST_PRIVATE_KEY
+        adapter._ws_connection = websocket
+        adapter._ws_active = True
+        return websocket
+
     @pytest.mark.asyncio
     async def test_send_success_via_stdin(self):
         adapter = _make_adapter()
@@ -406,6 +422,77 @@ class TestBuzzAdapterSend:
         assert stdin_text == "hello **markdown**"
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_send_typing_publishes_realtime_channel_and_thread_event(self):
+        adapter = _make_adapter()
+        websocket = self._activate_websocket(adapter)
+
+        await adapter.send_typing(CHANNEL, metadata={"thread_id": "a" * 64})
+
+        assert len(websocket.sent) == 1
+        frame, event = websocket.sent[0][0], websocket.sent[0][1]
+        assert frame == "EVENT"
+        assert event["kind"] == 20002
+        assert event["content"] == ""
+        assert ["h", CHANNEL] in event["tags"]
+        assert ["e", "a" * 64, "", "reply"] in event["tags"]
+
+    @pytest.mark.asyncio
+    async def test_edit_message_publishes_stream_edit_and_keeps_original_message_id(self):
+        adapter = _make_adapter()
+        websocket = self._activate_websocket(adapter)
+
+        result = await adapter.edit_message(
+            CHANNEL,
+            "b" * 64,
+            "progressive **answer**",
+            finalize=False,
+        )
+
+        assert result.success is True
+        assert result.message_id == "b" * 64
+        assert len(websocket.sent) == 1
+        event = websocket.sent[0][1]
+        assert event["kind"] == 40003
+        assert event["content"] == "progressive **answer**"
+        assert ["h", CHANNEL] in event["tags"]
+        assert ["e", "b" * 64] in event["tags"]
+
+    @pytest.mark.asyncio
+    async def test_edit_message_fails_cleanly_without_authenticated_websocket(self):
+        adapter = _make_adapter()
+
+        result = await adapter.edit_message(CHANNEL, "b" * 64, "answer")
+
+        assert result.success is False
+        assert "WebSocket" in result.error
+
+    @pytest.mark.asyncio
+    async def test_presence_event_uses_realtime_socket(self):
+        adapter = _make_adapter()
+        websocket = self._activate_websocket(adapter)
+
+        assert await adapter._publish_presence("online") is True
+
+        event = websocket.sent[0][1]
+        assert event["kind"] == 20001
+        assert event["content"] == "online"
+        assert event["tags"] == []
+
+    @pytest.mark.asyncio
+    async def test_disconnect_publishes_offline_and_cancels_presence_heartbeat(self):
+        adapter = _make_adapter()
+        websocket = self._activate_websocket(adapter)
+        heartbeat = asyncio.create_task(asyncio.sleep(60))
+        adapter._presence_task = heartbeat
+
+        await adapter.disconnect()
+
+        assert heartbeat.cancelled()
+        offline = [frame[1] for frame in websocket.sent if frame[1]["kind"] == 20001]
+        assert [event["content"] for event in offline] == ["offline"]
+        assert adapter._ws_connection is None
 
 
     @pytest.mark.asyncio
