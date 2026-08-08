@@ -1053,64 +1053,61 @@ class BuzzAdapter(BasePlatformAdapter):
             raise
 
     async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
-        """Drain history losslessly, then commit the observed high-water mark."""
         state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
-        self._channel_state[channel_id] = state
-        await self._drain_channel(channel_id, state, seed=True)
+        if await self._drain_channel(channel_id, state, seed=True):
+            self._channel_state[channel_id] = state
 
     async def _drain_channel(self, channel_id: str, state: dict, *, seed: bool = False) -> bool:
-        args_base = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+        base = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
+        floor = int(state.get("last_ts") or 0) if not seed else 0
         cursor = None
-        staged = []
         seen_pages = set()
-        floor_ts = int(state.get("last_ts") or 0) if not seed else 0
+        high_water = floor
         try:
             while True:
-                args = list(args_base)
+                args = list(base)
+                if floor:
+                    args += ["--since", str(floor)]
                 if cursor:
                     args += ["--before", str(cursor[0]), "--before-id", cursor[1]]
-                elif state.get("last_ts"):
-                    args += ["--since", str(state["last_ts"])]
                 code, out, err = await self._run_cli(args)
                 if code != 0:
                     logger.debug("Buzz: message drain of %s failed — %s", channel_id, _cli_error_message(err, code))
                     return False
                 page = _parse_message_page(out)
                 if not page:
-                    break
-                page_key = tuple(str(event.get("id") or "") for event in page)
-                if page_key in seen_pages:
-                    logger.warning("Buzz: repeated message page for %s; stopping safely", channel_id)
-                    break
-                seen_pages.add(page_key)
-                staged.extend(page)
+                    state["last_ts"] = high_water
+                    self._trim_seen(state)
+                    return True
+                key = tuple(str(e.get("id") or "") for e in page)
+                if key in seen_pages:
+                    raise ValueError("repeated message page")
+                seen_pages.add(key)
+                records = [(str(e.get("id") or ""), int(e.get("created_at") or 0)) for e in page]
+                if any(not i for i, _ in records):
+                    raise ValueError("message without id")
+                oldest = min(t for _, t in records)
+                next_cursor = (oldest, max(i for i, t in records if t == oldest))
+                if cursor and not (next_cursor[0] < cursor[0] or (next_cursor[0] == cursor[0] and next_cursor[1] > cursor[1])):
+                    raise ValueError("message cursor did not advance")
+                for event in page:
+                    ts = int(event.get("created_at") or 0)
+                    if not seed and ts < floor:
+                        continue
+                    if seed:
+                        state["seen"][str(event["id"])] = None
+                        self._maybe_latch_dm(channel_id, state, event)
+                    else:
+                        await self._handle_event(channel_id, state, event, advance_last_ts=False)
+                    high_water = max(high_water, ts)
                 if len(page) < _FETCH_LIMIT:
-                    break
-                last = page[-1]
-                ts = int(last.get("created_at") or 0)
-                if not seed and ts < floor_ts:
-                    break
-                event_id = str(last.get("id") or "")
-                if not event_id:
-                    return False
-                cursor = (ts, event_id)
-            for event in staged:
-                if not seed and int(event.get("created_at") or 0) < floor_ts:
-                    continue
-                if seed:
-                    event_id = str(event.get("id") or "")
-                    if event_id:
-                        state["seen"][event_id] = None
-                    state["last_ts"] = max(state["last_ts"], int(event.get("created_at") or 0))
-                    self._maybe_latch_dm(channel_id, state, event)
-                else:
-                    await self._handle_event(channel_id, state, event)
-            self._trim_seen(state)
-            return True
+                    state["last_ts"] = high_water
+                    self._trim_seen(state)
+                    return True
+                cursor = next_cursor
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             logger.warning("Buzz: invalid message page for %s: %s", channel_id, exc)
             return False
-
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
@@ -1159,7 +1156,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return
         await self._drain_channel(channel_id, state)
 
-    async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
+    async def _handle_event(self, channel_id: str, state: dict, event: dict, *, advance_last_ts: bool = True) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
@@ -1179,23 +1176,23 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._emit_inbound_ledger(event_id, "receipt", received, "received")
                 if int(event.get("kind") or 0) != _CHAT_KIND:
                     state["seen"][event_id] = None
-                    state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 pubkey = str(event.get("pubkey") or "").lower()
                 content = event.get("content")
                 if not pubkey or not isinstance(content, str) or not content.strip() or pubkey == self._self_pubkey:
                     state["seen"][event_id] = None
-                    state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 self._maybe_latch_dm(channel_id, state, event)
                 is_dm = state["chat_type"] == "dm"
                 if not is_dm and self.require_mention and not self._is_mentioned(content):
                     state["seen"][event_id] = None
-                    state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
                     state["seen"][event_id] = None
-                    state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 self._emit_inbound_ledger(event_id, "admission", received, "admitting")
                 dispatch_text = self._strip_mention(content)
@@ -1210,7 +1207,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     self._emit_inbound_ledger(event_id, "dispatch", received, "failed")
                     raise
                 state["seen"][event_id] = None
-                state["last_ts"] = max(state["last_ts"], created_at)
+                if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
                 self._emit_inbound_ledger(event_id, "dispatch", received, "success")
         finally:
             lock_state["users"] -= 1
