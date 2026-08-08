@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from collections import OrderedDict
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -186,6 +187,97 @@ class TestPollingDedupe:
         assert set(state["seen"]) == {"e1", "e2"}
         # Seeding must never replay history into the agent
         assert adapter._dispatched == []
+
+    @staticmethod
+    def _full_page(prefix="page", *, oldest_ts=100, newest_ts=200):
+        events = [
+            _event("a", content="@Chip history", created_at=oldest_ts),
+            _event("c", content="@Chip history", created_at=oldest_ts),
+            _event("b", content="@Chip history", created_at=oldest_ts),
+        ]
+        events.extend(
+            _event(f"{prefix}-{index:02d}", content="@Chip history", created_at=newest_ts)
+            for index in range(_buzz_mod._FETCH_LIMIT - len(events))
+        )
+        return events
+
+    @staticmethod
+    def _message_calls(cli):
+        return [args for args, _ in cli.calls if args[:2] == ["messages", "get"]]
+
+    @pytest.mark.asyncio
+    async def test_seed_drains_full_page_with_composite_cursor(self, adapter):
+        cli = _ScriptedCli()
+        first = self._full_page()
+        cli.script("messages", "get", first)
+        cli.script("messages", "get", [_event("older", created_at=90)])
+        adapter._run_cli = cli
+
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        state = adapter._channel_state[CHANNEL]
+        assert state["last_ts"] == 200
+        assert len(state["seen"]) == len(first) + 1
+        continuation = self._message_calls(cli)[1]
+        assert continuation[continuation.index("--before") + 1] == "100"
+        assert continuation[continuation.index("--before-id") + 1] == "c"
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_poll_keeps_fixed_floor_and_high_water_on_later_page_failure(self, adapter):
+        state = {"chat_type": "group", "last_ts": 100, "seen": OrderedDict()}
+        adapter._channel_state[CHANNEL] = state
+        cli = _ScriptedCli()
+        first = self._full_page(prefix="poll", oldest_ts=101, newest_ts=102)
+        cli.script("messages", "get", first)
+        cli.script("messages", "get", "not-json")
+        adapter._run_cli = cli
+
+        assert await adapter._drain_channel(CHANNEL, state) is False
+        assert state["last_ts"] == 100
+        assert len(adapter._dispatched) == len(first)
+        message_calls = self._message_calls(cli)
+        assert all("--since" in call for call in message_calls)
+        assert all(call[call.index("--since") + 1] == "100" for call in message_calls)
+        assert "--before-id" in message_calls[1]
+
+    @pytest.mark.asyncio
+    async def test_nonadvancing_full_page_fails_without_committing_high_water(self, adapter):
+        state = {"chat_type": "group", "last_ts": 100, "seen": OrderedDict()}
+        adapter._channel_state[CHANNEL] = state
+        cli = _ScriptedCli()
+        page = self._full_page(prefix="repeat", oldest_ts=101, newest_ts=102)
+        cli.script("messages", "get", page)
+        cli.script("messages", "get", page)
+        adapter._run_cli = cli
+
+        assert await adapter._drain_channel(CHANNEL, state) is False
+        assert state["last_ts"] == 100
+        assert len(self._message_calls(cli)) == 2
+
+    @pytest.mark.asyncio
+    async def test_exact_full_terminal_page_gets_empty_probe(self, adapter):
+        state = {"chat_type": "group", "last_ts": 100, "seen": OrderedDict()}
+        adapter._channel_state[CHANNEL] = state
+        cli = _ScriptedCli()
+        page = self._full_page(prefix="terminal", oldest_ts=101, newest_ts=102)
+        cli.script("messages", "get", page)
+        cli.script("messages", "get", [])
+        adapter._run_cli = cli
+
+        assert await adapter._drain_channel(CHANNEL, state) is True
+        assert state["last_ts"] == 102
+        assert len(self._message_calls(cli)) == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_seed_is_retryable_and_not_installed(self, adapter):
+        cli = _ScriptedCli()
+        cli.script("messages", "get", "not-json")
+        adapter._run_cli = cli
+
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        assert CHANNEL not in adapter._channel_state
 
     @pytest.mark.asyncio
     async def test_new_event_dispatched_once(self, adapter):

@@ -1061,7 +1061,6 @@ class BuzzAdapter(BasePlatformAdapter):
         base = ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
         floor = int(state.get("last_ts") or 0) if not seed else 0
         cursor = None
-        seen_pages = set()
         high_water = floor
         try:
             while True:
@@ -1079,10 +1078,6 @@ class BuzzAdapter(BasePlatformAdapter):
                     state["last_ts"] = high_water
                     self._trim_seen(state)
                     return True
-                key = tuple(str(e.get("id") or "") for e in page)
-                if key in seen_pages:
-                    raise ValueError("repeated message page")
-                seen_pages.add(key)
                 records = [(str(e.get("id") or ""), int(e.get("created_at") or 0)) for e in page]
                 if any(not i for i, _ in records):
                     raise ValueError("message without id")
@@ -1100,6 +1095,7 @@ class BuzzAdapter(BasePlatformAdapter):
                     else:
                         await self._handle_event(channel_id, state, event, advance_last_ts=False)
                     high_water = max(high_water, ts)
+                self._trim_seen(state)
                 if len(page) < _FETCH_LIMIT:
                     state["last_ts"] = high_water
                     self._trim_seen(state)
@@ -1176,23 +1172,27 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._emit_inbound_ledger(event_id, "receipt", received, "received")
                 if int(event.get("kind") or 0) != _CHAT_KIND:
                     state["seen"][event_id] = None
-                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 pubkey = str(event.get("pubkey") or "").lower()
                 content = event.get("content")
                 if not pubkey or not isinstance(content, str) or not content.strip() or pubkey == self._self_pubkey:
                     state["seen"][event_id] = None
-                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 self._maybe_latch_dm(channel_id, state, event)
                 is_dm = state["chat_type"] == "dm"
                 if not is_dm and self.require_mention and not self._is_mentioned(content):
                     state["seen"][event_id] = None
-                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
                     state["seen"][event_id] = None
-                    if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
+                    if advance_last_ts:
+                        state["last_ts"] = max(state["last_ts"], created_at)
                     return
                 self._emit_inbound_ledger(event_id, "admission", received, "admitting")
                 dispatch_text = self._strip_mention(content)
@@ -1207,7 +1207,8 @@ class BuzzAdapter(BasePlatformAdapter):
                     self._emit_inbound_ledger(event_id, "dispatch", received, "failed")
                     raise
                 state["seen"][event_id] = None
-                if advance_last_ts: state["last_ts"] = max(state["last_ts"], created_at)
+                if advance_last_ts:
+                    state["last_ts"] = max(state["last_ts"], created_at)
                 self._emit_inbound_ledger(event_id, "dispatch", received, "success")
         finally:
             lock_state["users"] -= 1
